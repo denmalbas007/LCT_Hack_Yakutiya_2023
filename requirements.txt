@@ -1,0 +1,15 @@
+tqdm
+joblib
+numpy
+pandas
+scikit-learn
+torch
+transformers
+datasets
+peft
+accelerate
+sentencepiece
+bitsandbytes
+requests
+tika
+protobuf
