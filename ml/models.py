@@ -7,9 +7,9 @@ import re
 import pandas as pd
 import torch
 from datasets import Dataset
-from sklearn.neighbors import NearestNeighbors
 from torch.utils.data import DataLoader
 from transformers import AutoModel, AutoTokenizer
+import faiss
 
 
 def mean_pooling(model_output, attention_mask):
@@ -58,92 +58,17 @@ class Summarizer:
         return summary
 
 
-class EmbeddingBuilder:
-    def __init__(self,
-                 model: AutoModel,
-                 tokenizer: AutoTokenizer,
-                 summarizer,
-                 csv_path: str,
-                 embeddings_save_path: str = "embeddings.npy",
-                 kdtree_save_path: str = "kdtree.joblib",
-                 batch_size: int = 1,
-                 device: str = "cuda"):
-        super().__init__()
-        self.device = device
-
-        self.model = model
-        self.tokenizer = tokenizer
-        self.model.eval()
-        self.model.to(self.device)
-
-        self.summarizer = summarizer
-
-        self.embeddings_save_path = embeddings_save_path
-        self.kdtree_save_path = kdtree_save_path
-
-        self.batch_size = batch_size
-
-        self._load_dataset(csv_path)
-        self._process_dataset()
-        self.extract_embeddings()
-
-    def _load_dataset(self, csv_path):
-        df = pd.read_csv(csv_path)
-        df["short_text"] = df["text"].progress_apply(self.summarizer.summarize)
-        self.dataset = Dataset.from_pandas(df)
-
-    def _process_dataset(self):
-        self.dataset = self.dataset.map(
-            lambda sample: self._preprocess_text(sample['short_text'])
-        )
-
-        self.dataset = self.dataset.remove_columns([
-            'short_text'
-        ])
-
-        self.dataset.set_format(type='torch', columns=['input_ids', 'attention_mask'])
-
-    def _preprocess_text(self, text):
-        # print(text)
-        out = self.tokenizer.encode_plus(text, max_length=512, truncation=True, padding="max_length")
-        return out
-
-    def extract_embeddings(self) -> None:
-        dataloader = DataLoader(self.dataset, batch_size=self.batch_size)
-
-        embeddings = []
-
-        for batch in tqdm(dataloader):
-            input_ids, attention_masks = batch["input_ids"], batch["attention_mask"]
-            input_ids, attention_masks = input_ids.to(self.device), attention_masks.to(self.device)
-
-            with torch.no_grad():
-                output = mean_pooling(self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_masks,
-                ), attention_masks)
-
-            embeddings.append(output.cpu())
-
-        embeddings = torch.cat(embeddings, dim=0).numpy()
-
-        kdtree = NearestNeighbors(n_neighbors=5,
-                                  metric='cosine',
-                                  algorithm='brute',
-                                  n_jobs=-1)
-        kdtree.fit(embeddings)
-
-        dump(kdtree, self.kdtree_save_path)
-
-
 class Retriever:
     def __init__(
             self,
             model: AutoModel,
             tokenizer: AutoTokenizer,
+            summarizer,
+            ood_model,
+            db_path: str,
+            d: int,
             k: int,
-            csv_path: str,
-            kdtree_load_path: str,
+            batch_size: int = 1,
             device: str = "cuda",
     ):
         super().__init__()
@@ -153,17 +78,46 @@ class Retriever:
         self.model.eval()
         self.model.to(self.device)
         self.tokenizer = tokenizer
-
-        self.df = pd.read_csv(csv_path)
+        self.summarizer = summarizer
+        self.ood_model = ood_model
 
         self.k = k
+        self.batch_size = batch_size
 
-        self.kdtree = self._load_indexer(kdtree_load_path)
+        self.index = faiss.IndexHNSW(d)
+        self.db = db
 
-    @staticmethod
-    def _load_indexer(path):
-        kdtree = load(path)
-        return kdtree
+    def add(self, csv_path):
+        """
+        Сюда приходит csv с новыми записями
+        """
+        df = pd.read_csv(csv_path)
+        df["short_text"] = df["text"].apply(self.summarizer.summarize)
+
+        dataset = Dataset.from_pandas(df)
+        dataset = dataset.map(lambda sample: self._preprocess_text(sample['short_text']))
+        dataset = dataset.remove_columns(['short_text'])
+        dataset.set_format(type='torch', columns=['input_ids', 'attention_mask'])
+        dataloader = DataLoader(dataset, batch_size=self.batch_size)
+
+        embeddings = []
+
+        for batch in tqdm(dataloader):
+            input_ids, attention_masks = batch["input_ids"], batch["attention_mask"]
+            input_ids, attention_masks = input_ids.to(self.device), attention_masks.to(self.device)
+
+            with torch.no_grad():
+                output = mean_pooling(
+                    self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_masks,
+                ), attention_masks)
+
+            embeddings.append(output.cpu())
+
+        embeddings = torch.cat(embeddings, dim=0).numpy()
+
+        self.index.add(embeddings)
 
     def _preprocess_text(self, text):
         out = self.tokenizer.encode_plus(
@@ -196,13 +150,15 @@ class Retriever:
                 .numpy()
             )
 
-    def search(self, text):
+    def query(self, text):
         sample = self._preprocess_text(text)
         embedding = self._get_embedding(sample)
+        ood_score = self.ood_model.predict(embedding.tolist())[0]
 
-        ind = self.kdtree.kneighbors(embedding, n_neighbors=5, return_distance=False)
-        return self.df.iloc[ind[0]]
-
+        if ood_score == 1:
+            return db.query("index" == self.index.search(embedding, k=self.k))
+        else:
+            return None
 
 class Chat:
     def __init__(self, model, tokenizer, generation_config, retriever, k: int = 3, device: str = "cuda"):
@@ -236,15 +192,16 @@ class Chat:
             **data,
             generation_config=self.generation_config,
         )[0]
-        # print(self.tokenizer.decode(data["input_ids"][0].tolist()))
+
         out = self.tokenizer.decode(output_ids.tolist(), skip_special_tokens=True)
         return out
 
     def answer(self, message):
-        retrieved_samples = self.retriever.search(message)
+        retrieved_samples = self.retriever.query(message)
+
+        if isinstance(retrieved_samples, type(None)):
+            return "По вашему запросу ничегоне найдено"
+
         prompt = self._form_prompt(message, retrieved_samples)
 
-        return (
-            self.generate(prompt)[13:],
-            f"На основе документа {retrieved_samples['url'].values[0]}",
-        )
+        return f"{self.generate(prompt)[13:]}, На основе документа {retrieved_samples['url'].values[0]}"
